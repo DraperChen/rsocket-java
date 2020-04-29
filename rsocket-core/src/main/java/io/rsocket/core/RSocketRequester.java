@@ -199,6 +199,10 @@ class RSocketRequester implements RSocket {
   }
 
   private Mono<Void> handleFireAndForget(Payload payload) {
+    if (payload.refCnt() <= 0) {
+      return Mono.error(new IllegalReferenceCountException());
+    }
+
     Throwable err = checkAvailable();
     if (err != null) {
       payload.release();
@@ -223,6 +227,10 @@ class RSocketRequester implements RSocket {
   }
 
   private Mono<Payload> handleRequestResponse(final Payload payload) {
+    if (payload.refCnt() <= 0) {
+      return Mono.error(new IllegalReferenceCountException());
+    }
+
     Throwable err = checkAvailable();
     if (err != null) {
       payload.release();
@@ -267,6 +275,10 @@ class RSocketRequester implements RSocket {
   }
 
   private Flux<Payload> handleRequestStream(final Payload payload) {
+    if (payload.refCnt() <= 0) {
+      return Flux.error(new IllegalReferenceCountException());
+    }
+
     Throwable err = checkAvailable();
     if (err != null) {
       payload.release();
@@ -285,6 +297,8 @@ class RSocketRequester implements RSocket {
     final AtomicInteger wip = new AtomicInteger(0);
 
     receivers.put(streamId, receiver);
+
+    int initialRetainCnt = payload.refCnt();
 
     return receiver
         .doOnRequest(
@@ -334,7 +348,7 @@ class RSocketRequester implements RSocket {
 
               // check if we need to release payload
               // only applicable if the cancel appears earlier than actual request
-              if (payload.refCnt() > 0) {
+              if (payload.refCnt() == initialRetainCnt) {
                 payload.release();
               } else {
                 sendProcessor.onNext(CancelFrameFlyweight.encode(allocator, streamId));
@@ -355,6 +369,10 @@ class RSocketRequester implements RSocket {
             (s, flux) -> {
               Payload payload = s.get();
               if (payload != null) {
+                if (payload.refCnt() <= 0) {
+                  return Mono.error(new IllegalReferenceCountException());
+                }
+
                 if (!PayloadValidationUtils.isValid(mtu, payload)) {
                   payload.release();
                   final IllegalArgumentException t =
@@ -371,7 +389,8 @@ class RSocketRequester implements RSocket {
         .doOnDiscard(ReferenceCounted.class, DROPPED_ELEMENTS_CONSUMER);
   }
 
-  private Flux<? extends Payload> handleChannel(Payload initialPayload, Flux<Payload> inboundFlux) {
+  private Flux<? extends Payload> handleChannel(
+      Payload initialPayload, Flux<Payload> inboundFluxWithInitialPayload) {
     final UnboundedProcessor<ByteBuf> sendProcessor = this.sendProcessor;
     final int streamId = streamIdSupplier.nextStreamId(receivers);
 
@@ -397,21 +416,29 @@ class RSocketRequester implements RSocket {
               request(1);
               return;
             }
-            if (!PayloadValidationUtils.isValid(mtu, payload)) {
-              payload.release();
+
+            try {
+              if (!PayloadValidationUtils.isValid(mtu, payload)) {
+                payload.release();
+                cancel();
+                final IllegalArgumentException t =
+                    new IllegalArgumentException(INVALID_PAYLOAD_ERROR_MESSAGE);
+                errorConsumer.accept(t);
+                // no need to send any errors.
+                sendProcessor.onNext(CancelFrameFlyweight.encode(allocator, streamId));
+                receiver.onError(t);
+                return;
+              }
+              final ByteBuf frame =
+                  PayloadFrameFlyweight.encodeNextReleasingPayload(allocator, streamId, payload);
+
+              sendProcessor.onNext(frame);
+            } catch (IllegalReferenceCountException e) {
               cancel();
-              final IllegalArgumentException t =
-                  new IllegalArgumentException(INVALID_PAYLOAD_ERROR_MESSAGE);
-              errorConsumer.accept(t);
               // no need to send any errors.
               sendProcessor.onNext(CancelFrameFlyweight.encode(allocator, streamId));
-              receiver.onError(t);
-              return;
+              receiver.onError(e);
             }
-            final ByteBuf frame =
-                PayloadFrameFlyweight.encodeNextReleasingPayload(allocator, streamId, payload);
-
-            sendProcessor.onNext(frame);
           }
 
           @Override
@@ -464,7 +491,7 @@ class RSocketRequester implements RSocket {
                       senders.put(streamId, upstreamSubscriber);
                       receivers.put(streamId, receiver);
 
-                      inboundFlux
+                      inboundFluxWithInitialPayload
                           .limitRate(Queues.SMALL_BUFFER_SIZE)
                           .doOnDiscard(ReferenceCounted.class, DROPPED_ELEMENTS_CONSUMER)
                           .subscribe(upstreamSubscriber);
@@ -511,6 +538,10 @@ class RSocketRequester implements RSocket {
   }
 
   private Mono<Void> handleMetadataPush(Payload payload) {
+    if (payload.refCnt() <= 0) {
+      return Mono.error(new IllegalReferenceCountException());
+    }
+
     Throwable err = this.terminationError;
     if (err != null) {
       payload.release();
@@ -542,10 +573,6 @@ class RSocketRequester implements RSocket {
       return lh.leaseError();
     }
     return null;
-  }
-
-  private boolean contains(int streamId) {
-    return receivers.containsKey(streamId);
   }
 
   private void handleIncomingFrames(ByteBuf frame) {

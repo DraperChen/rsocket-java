@@ -398,19 +398,24 @@ class RSocketResponder implements RSocket {
               isEmpty = false;
             }
 
-            if (!PayloadValidationUtils.isValid(mtu, payload)) {
-              payload.release();
-              cancel();
-              final IllegalArgumentException t =
-                  new IllegalArgumentException(INVALID_PAYLOAD_ERROR_MESSAGE);
-              handleError(streamId, t);
-              return;
-            }
+            try {
+              if (!PayloadValidationUtils.isValid(mtu, payload)) {
+                payload.release();
+                cancel();
+                final IllegalArgumentException t =
+                    new IllegalArgumentException(INVALID_PAYLOAD_ERROR_MESSAGE);
+                handleError(streamId, t);
+                return;
+              }
 
-            ByteBuf byteBuf =
-                PayloadFrameFlyweight.encodeNextCompleteReleasingPayload(
-                    allocator, streamId, payload);
-            sendProcessor.onNext(byteBuf);
+              ByteBuf byteBuf =
+                  PayloadFrameFlyweight.encodeNextCompleteReleasingPayload(
+                      allocator, streamId, payload);
+              sendProcessor.onNext(byteBuf);
+            } catch (IllegalReferenceCountException e) {
+              this.cancel();
+              handleError(streamId, e);
+            }
           }
 
           @Override
@@ -450,8 +455,32 @@ class RSocketResponder implements RSocket {
 
           @Override
           protected void hookOnNext(Payload payload) {
-            if (!PayloadValidationUtils.isValid(mtu, payload)) {
-              payload.release();
+            try {
+              if (!PayloadValidationUtils.isValid(mtu, payload)) {
+                payload.release();
+                // specifically for requestChannel case so when Payload is invalid we will not be
+                // sending CancelFrame and ErrorFrame
+                // Note: CancelFrame is redundant and due to spec
+                // (https://github.com/rsocket/rsocket/blob/master/Protocol.md#request-channel)
+                // Upon receiving an ERROR[APPLICATION_ERROR|REJECTED|CANCELED|INVALID], the stream
+                // is
+                // terminated on both Requester and Responder.
+                // Upon sending an ERROR[APPLICATION_ERROR|REJECTED|CANCELED|INVALID], the stream is
+                // terminated on both the Requester and Responder.
+                if (requestChannel != null) {
+                  channelProcessors.remove(streamId, requestChannel);
+                }
+                cancel();
+                final IllegalArgumentException t =
+                    new IllegalArgumentException(INVALID_PAYLOAD_ERROR_MESSAGE);
+                handleError(streamId, t);
+                return;
+              }
+
+              ByteBuf byteBuf =
+                  PayloadFrameFlyweight.encodeNextReleasingPayload(allocator, streamId, payload);
+              sendProcessor.onNext(byteBuf);
+            } catch (IllegalReferenceCountException e) {
               // specifically for requestChannel case so when Payload is invalid we will not be
               // sending CancelFrame and ErrorFrame
               // Note: CancelFrame is redundant and due to spec
@@ -464,15 +493,8 @@ class RSocketResponder implements RSocket {
                 channelProcessors.remove(streamId, requestChannel);
               }
               cancel();
-              final IllegalArgumentException t =
-                  new IllegalArgumentException(INVALID_PAYLOAD_ERROR_MESSAGE);
-              handleError(streamId, t);
-              return;
+              handleError(streamId, e);
             }
-
-            ByteBuf byteBuf =
-                PayloadFrameFlyweight.encodeNextReleasingPayload(allocator, streamId, payload);
-            sendProcessor.onNext(byteBuf);
           }
 
           @Override
